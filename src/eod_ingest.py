@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -36,7 +37,39 @@ from pathlib import Path
 import psycopg
 from psycopg.rows import dict_row
 
-DSN = "postgresql://localhost:5432/marketdata"
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_ENV  = os.environ.get("EOD_ENV", "dev")
+_DSN_FALLBACK = "postgresql://localhost:5433/tcdata"
+
+
+def _load_simple_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip("'\"")
+    return values
+
+
+def _resolve_dsn() -> str:
+    """Resolve DSN from cfg/<env>.env → EOD_DSN env var → hardcoded fallback.
+
+    Mirrors the resolution logic in deploy_schema.py so both tools use the
+    same default connection without requiring a --dsn flag on every invocation.
+    """
+    env_file   = _PROJECT_ROOT / "cfg" / f"{_DEFAULT_ENV}.env"
+    file_values = _load_simple_env_file(env_file)
+    return os.environ.get("EOD_DSN", file_values.get("EOD_DSN", _DSN_FALLBACK))
+
+
+DSN = _resolve_dsn()
 
 YAHOO_TYPE_MAP = {
     "EQUITY": "equity",
@@ -116,7 +149,18 @@ def auto_add_instruments(
             )
             cur.fetchone()
 
-    conn.commit()
+    # Do not commit inside this helper.
+    #
+    # `prices` needs stub creation and price upserts to behave like one atomic
+    # unit of work: either both parts land, or neither does. If we commit here
+    # and the later `eod_price` upsert fails, we leave behind newly-created
+    # instruments with no matching prices. That partial state is surprising for
+    # operators and changes the behavior of reruns, because those symbols are no
+    # longer considered "unknown" on the second attempt.
+    #
+    # By leaving the transaction open, the caller can commit only after the
+    # actual ingest succeeds, and psycopg will roll everything back together if
+    # an exception escapes the surrounding connection context.
     updated_map = load_symbol_map(conn)
     created_syms = sorted(set(updated_map) - set(sym_map))
     print(f"✓ Auto-created {len(created_syms)} instrument stub(s): {created_syms}")
@@ -192,6 +236,18 @@ def cmd_prices(args):
     all_symbols = {r.symbol for r in rows}
 
     with psycopg.connect(args.dsn) as conn:
+        # Keep the whole ingest in a single transaction.
+        #
+        # This command may do two writes in sequence:
+        # 1. create missing instrument stubs
+        # 2. upsert prices that reference those instruments
+        #
+        # Those writes are logically inseparable. A failure in step 2 should not
+        # leave step 1 committed, otherwise the database ends up in a "half
+        # ingested" state that is hard to reason about operationally. The
+        # connection context will commit on normal exit and roll back on errors,
+        # so we deliberately avoid intermediate commits before the final upsert
+        # has succeeded.
         if args.auto_add:
             sym_map = auto_add_instruments(conn, all_symbols, args.exchange, args.currency)
         else:
@@ -300,6 +356,11 @@ def cmd_enrich(args):
                     (info["name"], info["sector"], info["instrument_type"],
                      info["currency"], row["instrument_id"]),
                 )
+            # Commit per-instrument intentionally: enrichment is a slow,
+            # best-effort loop against an external API. Committing each update
+            # immediately preserves progress if the loop is interrupted midway
+            # (network error, rate limit, KeyboardInterrupt), avoiding the need
+            # to re-fetch metadata for symbols that were already enriched.
             conn.commit()
             enriched += 1
             print(f"  ✓ {sym} → {info['name']}  ({info['instrument_type']}, {info['sector'] or '—'})")
@@ -392,6 +453,12 @@ def cmd_import_instruments(args):
 # ── Corporate action management ─────────────────────────────────────────────
 
 def cmd_add_action(args):
+    try:
+        ex_date = date.fromisoformat(args.ex_date)
+    except ValueError:
+        print(f"Invalid --ex-date '{args.ex_date}': expected YYYY-MM-DD", file=sys.stderr)
+        sys.exit(1)
+
     with psycopg.connect(args.dsn) as conn:
         sym_map = load_symbol_map(conn)
         sym = args.symbol.upper()
@@ -405,7 +472,7 @@ def cmd_add_action(args):
                        (instrument_id, ex_date, action_type, factor, description)
                    VALUES (%s, %s, %s, %s, %s)
                    RETURNING action_id""",
-                (sym_map[sym], args.ex_date, args.action_type, args.factor, args.desc),
+                (sym_map[sym], ex_date, args.action_type, args.factor, args.desc),
             )
             aid = cur.fetchone()[0]
         conn.commit()

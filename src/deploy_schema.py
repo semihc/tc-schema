@@ -9,13 +9,14 @@ Dependencies:  pip install psycopg[binary]
 
 Usage:
     python src/deploy_schema.py
-    python src/deploy_schema.py --dsn "postgresql://user:pw@host:5432/marketdata"
+    python src/deploy_schema.py --dsn "postgresql://user:pw@host:5433/tcdata"
     python src/deploy_schema.py --migrations ./sql/boot
     python src/deploy_schema.py --check      # verify only, don't apply
     python src/deploy_schema.py --create-db  # create database if missing
 
 Environment variables (override defaults):
-    EOD_DSN              postgresql://localhost:5432/marketdata
+    EOD_ENV              dev|prod   (selects cfg/<env>.env, default: dev)
+    EOD_DSN              overrides DSN from cfg/<env>.env when set
     EOD_MIGRATIONS_DIR   ./sql/boot
 """
 
@@ -34,11 +35,14 @@ from psycopg.rows import dict_row
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-DEFAULT_DSN = os.environ.get("EOD_DSN", "postgresql://localhost:5432/marketdata")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_ENV = os.environ.get("EOD_ENV", "dev")
 DEFAULT_MIGRATIONS = os.environ.get(
     "EOD_MIGRATIONS_DIR",
-    str(Path(__file__).resolve().parent.parent / "sql" / "boot"),
+    str(PROJECT_ROOT / "sql" / "boot"),
 )
+
+DEFAULT_DSN_FALLBACK = "postgresql://localhost:5433/tcdata"
 
 # Migration files must match: NNN_description.sql  (e.g. 001_eod_schema.sql)
 MIGRATION_PATTERN = re.compile(r"^(\d{3})_.+\.sql$")
@@ -56,6 +60,48 @@ class Migration:
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+def load_simple_env_file(path: Path) -> dict[str, str]:
+    """Read KEY=VALUE pairs from a small .env file.
+
+    This loader is intentionally minimal because the project config files are
+    simple and checked into the repo. We ignore blank lines and comments, and
+    leave shell-style expansion out of scope so DSN resolution stays explicit
+    and predictable.
+    """
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip("'\"")
+
+    return values
+
+
+def resolve_default_dsn() -> str:
+    """Resolve the default DSN from cfg/<env>.env, then env vars, then fallback."""
+    env_name = DEFAULT_ENV
+    env_file = PROJECT_ROOT / "cfg" / f"{env_name}.env"
+    file_values = load_simple_env_file(env_file)
+
+    # Default DSN should come from the selected config file so local runs pick
+    # up the repo's dev/prod conventions without requiring a long CLI flag.
+    # We still allow the process environment to win, because automation and
+    # one-off operational commands often need to override the checked-in file
+    # without editing repository config.
+    return os.environ.get(
+        "EOD_DSN",
+        file_values.get("EOD_DSN", DEFAULT_DSN_FALLBACK),
+    )
+
+
+DEFAULT_DSN = resolve_default_dsn()
+
 def parse_dsn(dsn: str) -> tuple[str, str]:
     """Extract (server_dsn, dbname) from a full DSN.
     server_dsn connects to 'postgres' db for admin operations."""
@@ -66,7 +112,7 @@ def parse_dsn(dsn: str) -> tuple[str, str]:
         dbname = dbname.split("?")[0]
         server_dsn = f"{base}/postgres"
         return server_dsn, dbname
-    return dsn, "marketdata"
+    return dsn, "tcdata"
 
 
 def discover_migrations(directory: Path) -> list[Migration]:
@@ -112,6 +158,25 @@ def create_database(server_dsn: str, dbname: str):
     print(f"✓ Created database: {dbname}")
 
 
+def drop_database(server_dsn: str, dbname: str):
+    with psycopg.connect(server_dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            # Terminate active connections first so DROP DATABASE doesn't block.
+            cur.execute(
+                psycopg.sql.SQL(
+                    "SELECT pg_terminate_backend(pid)"
+                    "  FROM pg_stat_activity"
+                    " WHERE datname = {} AND pid <> pg_backend_pid()"
+                ).format(psycopg.sql.Literal(dbname))
+            )
+            cur.execute(
+                psycopg.sql.SQL("DROP DATABASE IF EXISTS {}").format(
+                    psycopg.sql.Identifier(dbname)
+                )
+            )
+    print(f"✓ Dropped database: {dbname}")
+
+
 def get_applied_versions(conn: psycopg.Connection) -> set[int]:
     """Return set of already-applied migration versions."""
     with conn.cursor() as cur:
@@ -119,8 +184,7 @@ def get_applied_versions(conn: psycopg.Connection) -> set[int]:
         cur.execute("""
             SELECT EXISTS (
                 SELECT 1 FROM information_schema.tables
-                 WHERE table_schema = 'current_schema'
-                    OR (table_schema = 'public' AND table_name = 'schema_version')
+                 WHERE table_schema = 'public' AND table_name = 'schema_version'
             )
         """)
         if not cur.fetchone()[0]:
@@ -149,6 +213,44 @@ def apply_migration(conn: psycopg.Connection, migration: Migration):
             (migration.version, migration.description),
         )
     conn.commit()
+
+
+def get_available_extension_version(conn: psycopg.Connection, name: str) -> str | None:
+    """Return the installable version for an extension, or None if unavailable."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT default_version
+              FROM pg_available_extensions
+             WHERE name = %s
+            """,
+            (name,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def ensure_timescaledb_available(conn: psycopg.Connection):
+    """Fail early with a friendly message if TimescaleDB is not installed."""
+    available_version = get_available_extension_version(conn, "timescaledb")
+    if available_version:
+        return
+
+    print(
+        "Cannot apply migrations: TimescaleDB is not installed on this PostgreSQL server.",
+        file=sys.stderr,
+    )
+    print(
+        "The schema starts by running `CREATE EXTENSION timescaledb`, so migration "
+        "001 would fail immediately.",
+        file=sys.stderr,
+    )
+    print(
+        "Install the TimescaleDB extension for your PostgreSQL instance, then rerun "
+        "this command.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def verify_schema(conn: psycopg.Connection) -> dict:
@@ -285,6 +387,7 @@ def main():
 examples:
   %(prog)s                                     # apply pending migrations
   %(prog)s --create-db                         # create DB first if needed
+  %(prog)s --drop-db                           # drop, recreate, and migrate
   %(prog)s --check                             # verify schema, don't change
   %(prog)s --dsn postgresql://prod:5432/mktdata
   %(prog)s --migrations /opt/eod/sql/boot
@@ -295,6 +398,8 @@ examples:
                         help="Directory containing NNN_*.sql files")
     parser.add_argument("--create-db", action="store_true",
                         help="Create the database if it doesn't exist")
+    parser.add_argument("--drop-db", action="store_true",
+                        help="Drop the database if it exists, recreate it, then run all migrations")
     parser.add_argument("--check", action="store_true",
                         help="Verify schema only, don't apply migrations")
     args = parser.parse_args()
@@ -302,8 +407,18 @@ examples:
     migrations_dir = Path(args.migrations)
     server_dsn, dbname = parse_dsn(args.dsn)
 
+    # ── Drop + recreate if requested ──
+    if args.drop_db:
+        print(f"WARNING: about to drop and recreate '{dbname}' — all data will be lost.")
+        confirm = input("Type the database name to confirm: ").strip()
+        if confirm != dbname:
+            print("Aborted.", file=sys.stderr)
+            sys.exit(1)
+        drop_database(server_dsn, dbname)
+        create_database(server_dsn, dbname)
+
     # ── Create database if requested ──
-    if args.create_db:
+    elif args.create_db:
         if database_exists(server_dsn, dbname):
             print(f"Database '{dbname}' already exists.")
         else:
@@ -332,6 +447,11 @@ examples:
     # ── Connect and apply ──
     try:
         with psycopg.connect(args.dsn) as conn:
+            # Preflight the server before we start running migration files.
+            # This gives a much clearer failure than letting the first migration
+            # abort inside `CREATE EXTENSION timescaledb`.
+            ensure_timescaledb_available(conn)
+
             applied = get_applied_versions(conn)
             pending = [m for m in migrations if m.version not in applied]
 

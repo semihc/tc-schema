@@ -9,6 +9,10 @@ __pycache__/
 .env.local
 *.local
 
+# Config files that may contain credentials — only dev.env (no real creds) is
+# committed; prod.env and any .local overrides must never be checked in.
+cfg/prod.env
+
 # IDE / Editor
 .vscode/
 *.swp

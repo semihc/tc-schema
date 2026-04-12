@@ -22,7 +22,8 @@ tc-schema/
 pip install psycopg[binary]
 
 # 1. Create database and apply schema
-python src/deploy_schema.py --create-db --dsn "postgresql://localhost:5432/marketdata"
+# By default the script reads EOD_DSN from cfg/dev.env.
+python src/deploy_schema.py --create-db
 
 # 2. Verify
 python src/deploy_schema.py --check
@@ -55,5 +56,6 @@ applies only new ones, and records each successful migration in
 
 | Variable             | Default                                      |
 |----------------------|----------------------------------------------|
-| `EOD_DSN`            | `postgresql://localhost:5432/marketdata`      |
+| `EOD_ENV`            | `dev` (`cfg/dev.env`; `prod` uses `cfg/prod.env`) |
+| `EOD_DSN`            | Overrides `cfg/<env>.env` when set            |
 | `EOD_MIGRATIONS_DIR` | `./sql/boot`                                  |

@@ -34,6 +34,9 @@ CREATE TABLE IF NOT EXISTS instrument (
 -- --------------------------------------------------------------------------
 -- 2. EOD Prices
 -- --------------------------------------------------------------------------
+-- NOTE: instrument_id carries no FOREIGN KEY constraint. TimescaleDB
+-- hypertables do not support FK constraints on the partitioned table itself.
+-- Referential integrity is enforced at the application layer (eod_ingest.py).
 CREATE TABLE IF NOT EXISTS eod_price (
     trade_date      DATE          NOT NULL,
     instrument_id   INT           NOT NULL,
@@ -135,13 +138,30 @@ LEFT JOIN eod_price p
     AND p.trade_date    = ca.ex_date;
 
 CREATE OR REPLACE VIEW v_cumulative_factor AS
+-- Each row here represents the adjustment factor that should be applied to
+-- prices strictly before `ex_date`.
+--
+-- The important subtlety is the window direction:
+-- - for the row at ex_date = 2026-06-01 we need that action's factor
+-- - for the row at ex_date = 2026-03-01 we need the product of the
+--   2026-03-01 action and every later action as well
+--
+-- In other words, the row for the earliest future action must already contain
+-- the full "future adjustment chain". That way `v_adjusted_price` can join to
+-- the nearest future ex-date and still receive the correct cumulative factor.
+--
+-- Ordering ascending with "CURRENT ROW AND UNBOUNDED FOLLOWING" gives exactly
+-- that behavior: the current action plus all later actions. The previous
+-- descending formulation did the opposite, accumulating older actions instead
+-- and producing incorrect adjusted prices once an instrument had more than one
+-- corporate action on record.
 SELECT
     instrument_id,
     ex_date,
     EXP(
         SUM(LN(day_factor)) OVER (
             PARTITION BY instrument_id
-            ORDER BY ex_date DESC
+            ORDER BY ex_date ASC
             ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
         )
     ) AS cumulative_factor
@@ -160,6 +180,15 @@ SELECT
     COALESCE(cf.cumulative_factor, 1.0) AS factor_applied
 FROM eod_price p
 LEFT JOIN LATERAL (
+    -- Join to the nearest future ex-date, not every future action row.
+    --
+    -- This only works if `v_cumulative_factor` is defined so that the earliest
+    -- future action already carries the product of that action and all later
+    -- actions. With that invariant in place, picking the closest future
+    -- ex-date gives the exact factor needed for the historical price row.
+    --
+    -- The strict `>` is intentional: an action with ex-date D adjusts prices
+    -- before D, not the price on D itself.
     SELECT cumulative_factor
       FROM v_cumulative_factor c
      WHERE c.instrument_id = p.instrument_id
@@ -168,6 +197,10 @@ LEFT JOIN LATERAL (
      LIMIT 1
 ) cf ON TRUE;
 
+-- NOTE: this view chains through v_adjusted_price → v_cumulative_factor →
+-- v_adjustment_factor. On large datasets, consider materialising the
+-- intermediate views (e.g. as materialized views or temp tables) for
+-- performance-sensitive queries rather than querying v_daily_return directly.
 CREATE OR REPLACE VIEW v_daily_return AS
 SELECT
     instrument_id, trade_date, adj_close,
