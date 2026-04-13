@@ -2,7 +2,7 @@
 """
 deploy_schema.py — Automated, idempotent schema deployment.
 
-Creates the database if it doesn't exist, runs all numbered migration
+Creates the database if it doesn't exist, runs all numbered patch
 files in order, skips already-applied versions.
 
 Dependencies:  pip install psycopg[binary]
@@ -10,14 +10,14 @@ Dependencies:  pip install psycopg[binary]
 Usage:
     python src/deploy_schema.py
     python src/deploy_schema.py --dsn "postgresql://user:pw@host:5433/tcdata"
-    python src/deploy_schema.py --migrations ./sql/boot
+    python src/deploy_schema.py --patch ./sql/patch
     python src/deploy_schema.py --check      # verify only, don't apply
     python src/deploy_schema.py --create-db  # create database if missing
 
 Environment variables (override defaults):
-    EOD_ENV              dev|prod   (selects cfg/<env>.env, default: dev)
-    EOD_DSN              overrides DSN from cfg/<env>.env when set
-    EOD_MIGRATIONS_DIR   ./sql/boot
+    EOD_ENV          dev|prod   (selects cfg/<env>.env, default: dev)
+    EOD_DSN          overrides DSN from cfg/<env>.env when set
+    EOD_PATCH_DIR    ./sql/patch
 """
 
 from __future__ import annotations
@@ -37,21 +37,21 @@ from psycopg.rows import dict_row
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ENV = os.environ.get("EOD_ENV", "dev")
-DEFAULT_MIGRATIONS = os.environ.get(
-    "EOD_MIGRATIONS_DIR",
-    str(PROJECT_ROOT / "sql" / "boot"),
+DEFAULT_PATCH_DIR = os.environ.get(
+    "EOD_PATCH_DIR",
+    str(PROJECT_ROOT / "sql" / "patch"),
 )
 
 DEFAULT_DSN_FALLBACK = "postgresql://localhost:5433/tcdata"
 
-# Migration files must match: NNN_description.sql  (e.g. 001_eod_schema.sql)
-MIGRATION_PATTERN = re.compile(r"^(\d{3})_.+\.sql$")
+# Patch files must match: NNN_description.sql  (e.g. 001_eod_schema.sql)
+PATCH_PATTERN = re.compile(r"^(\d{3})_.+\.sql$")
 
 
 # ── Data types ───────────────────────────────────────────────────────────────
 
 @dataclass
-class Migration:
+class Patch:
     version: int
     filename: str
     path: Path
@@ -115,26 +115,26 @@ def parse_dsn(dsn: str) -> tuple[str, str]:
     return dsn, "tcdata"
 
 
-def discover_migrations(directory: Path) -> list[Migration]:
-    """Find and sort migration files."""
+def discover_patches(directory: Path) -> list[Patch]:
+    """Find and sort patch files."""
     if not directory.is_dir():
-        print(f"Migrations directory not found: {directory}", file=sys.stderr)
+        print(f"Patch directory not found: {directory}", file=sys.stderr)
         sys.exit(1)
 
-    migrations = []
+    patches = []
     for f in sorted(directory.iterdir()):
-        match = MIGRATION_PATTERN.match(f.name)
+        match = PATCH_PATTERN.match(f.name)
         if match:
             version = int(match.group(1))
             description = f.stem.split("_", 1)[1].replace("_", " ")
-            migrations.append(Migration(
+            patches.append(Patch(
                 version=version,
                 filename=f.name,
                 path=f,
                 description=description,
             ))
 
-    return sorted(migrations, key=lambda m: m.version)
+    return sorted(patches, key=lambda p: p.version)
 
 
 def database_exists(server_dsn: str, dbname: str) -> bool:
@@ -178,7 +178,7 @@ def drop_database(server_dsn: str, dbname: str):
 
 
 def get_applied_versions(conn: psycopg.Connection) -> set[int]:
-    """Return set of already-applied migration versions."""
+    """Return set of already-applied patch versions."""
     with conn.cursor() as cur:
         # Check if schema_version table exists
         cur.execute("""
@@ -198,9 +198,9 @@ def get_applied_versions(conn: psycopg.Connection) -> set[int]:
             return set()
 
 
-def apply_migration(conn: psycopg.Connection, migration: Migration):
-    """Execute a single migration file."""
-    sql = migration.path.read_text(encoding="utf-8")
+def apply_patch(conn: psycopg.Connection, patch: Patch):
+    """Execute a single patch file."""
+    sql = patch.path.read_text(encoding="utf-8")
     with conn.cursor() as cur:
         cur.execute(sql)
         cur.execute(
@@ -210,7 +210,7 @@ def apply_migration(conn: psycopg.Connection, migration: Migration):
             ON CONFLICT (version) DO UPDATE
             SET description = EXCLUDED.description
             """,
-            (migration.version, migration.description),
+            (patch.version, patch.description),
         )
     conn.commit()
 
@@ -237,11 +237,11 @@ def ensure_timescaledb_available(conn: psycopg.Connection):
         return
 
     print(
-        "Cannot apply migrations: TimescaleDB is not installed on this PostgreSQL server.",
+        "Cannot apply patches: TimescaleDB is not installed on this PostgreSQL server.",
         file=sys.stderr,
     )
     print(
-        "The schema starts by running `CREATE EXTENSION timescaledb`, so migration "
+        "The schema starts by running `CREATE EXTENSION timescaledb`, so patch "
         "001 would fail immediately.",
         file=sys.stderr,
     )
@@ -324,16 +324,18 @@ def verify_schema(conn: psycopg.Connection) -> dict:
 
         # Row counts
         for table in ["instrument", "eod_price", "corporate_action"]:
-            cur.execute(f"SELECT count(*) AS n FROM {table}")  # noqa: S608
+            cur.execute(psycopg.sql.SQL("SELECT count(*) AS n FROM {}").format(
+                psycopg.sql.Identifier(table)
+            ))
             checks[f"rows:{table}"] = cur.fetchone()["n"]
 
-        # Applied migrations
+        # Applied patches
         try:
             cur.execute("SELECT version, description, applied_at FROM schema_version ORDER BY version")
-            checks["migrations"] = cur.fetchall()
+            checks["patches"] = cur.fetchall()
         except psycopg.errors.UndefinedTable:
             conn.rollback()
-            checks["migrations"] = []
+            checks["patches"] = []
 
     return checks
 
@@ -356,15 +358,15 @@ def print_verification(checks: dict):
         if key.startswith("rows:"):
             print(f"  {key.replace('rows:', ''):<20} {val:>10} rows")
 
-    # Migrations
+    # Applied patches
     print()
-    migrations = checks.get("migrations", [])
-    if migrations:
-        print("  Applied migrations:")
-        for m in migrations:
-            print(f"    v{m['version']:03d}  {m['description']:<30}  {m['applied_at']:%Y-%m-%d %H:%M}")
+    patches = checks.get("patches", [])
+    if patches:
+        print("  Applied patches:")
+        for p in patches:
+            print(f"    v{p['version']:03d}  {p['description']:<30}  {p['applied_at']:%Y-%m-%d %H:%M}")
     else:
-        print("  No migrations applied yet.")
+        print("  No patches applied yet.")
 
     # Overall status
     print()
@@ -381,30 +383,30 @@ def print_verification(checks: dict):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Deploy EOD schema — idempotent migration runner",
+        description="Deploy EOD schema — idempotent patch runner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  %(prog)s                                     # apply pending migrations
+  %(prog)s                                     # apply pending patches
   %(prog)s --create-db                         # create DB first if needed
-  %(prog)s --drop-db                           # drop, recreate, and migrate
+  %(prog)s --drop-db                           # drop, recreate, and patch
   %(prog)s --check                             # verify schema, don't change
   %(prog)s --dsn postgresql://prod:5432/mktdata
-  %(prog)s --migrations /opt/eod/sql/boot
+  %(prog)s --patch /opt/eod/sql/patch
         """,
     )
     parser.add_argument("--dsn", default=DEFAULT_DSN, help="PostgreSQL connection string")
-    parser.add_argument("--migrations", default=DEFAULT_MIGRATIONS,
+    parser.add_argument("--patch", default=DEFAULT_PATCH_DIR,
                         help="Directory containing NNN_*.sql files")
     parser.add_argument("--create-db", action="store_true",
                         help="Create the database if it doesn't exist")
     parser.add_argument("--drop-db", action="store_true",
-                        help="Drop the database if it exists, recreate it, then run all migrations")
+                        help="Drop the database if it exists, recreate it, then run all patches")
     parser.add_argument("--check", action="store_true",
-                        help="Verify schema only, don't apply migrations")
+                        help="Verify schema only, don't apply patches")
     args = parser.parse_args()
 
-    migrations_dir = Path(args.migrations)
+    patch_dir = Path(args.patch)
     server_dsn, dbname = parse_dsn(args.dsn)
 
     # ── Drop + recreate if requested ──
@@ -435,33 +437,33 @@ examples:
             sys.exit(1)
         return
 
-    # ── Discover migrations ──
-    migrations = discover_migrations(migrations_dir)
-    if not migrations:
-        print(f"No migration files found in {migrations_dir}", file=sys.stderr)
+    # ── Discover patches ──
+    patches = discover_patches(patch_dir)
+    if not patches:
+        print(f"No patch files found in {patch_dir}", file=sys.stderr)
         print(f"Expected files like: 001_eod_schema.sql", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Found {len(migrations)} migration(s) in {migrations_dir}")
+    print(f"Found {len(patches)} patch(es) in {patch_dir}")
 
     # ── Connect and apply ──
     try:
         with psycopg.connect(args.dsn) as conn:
-            # Preflight the server before we start running migration files.
-            # This gives a much clearer failure than letting the first migration
+            # Preflight the server before we start running patch files.
+            # This gives a much clearer failure than letting the first patch
             # abort inside `CREATE EXTENSION timescaledb`.
             ensure_timescaledb_available(conn)
 
             applied = get_applied_versions(conn)
-            pending = [m for m in migrations if m.version not in applied]
+            pending = [p for p in patches if p.version not in applied]
 
             if not pending:
                 print("Schema is up to date — nothing to apply.")
             else:
-                print(f"Applying {len(pending)} pending migration(s)...")
-                for m in pending:
-                    print(f"  → v{m.version:03d}  {m.description} ({m.filename})")
-                    apply_migration(conn, m)
+                print(f"Applying {len(pending)} pending patch(es)...")
+                for p in pending:
+                    print(f"  → v{p.version:03d}  {p.description} ({p.filename})")
+                    apply_patch(conn, p)
                     print(f"    ✓ applied")
 
             # Verify

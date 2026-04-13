@@ -10,7 +10,7 @@ tc-schema/
 │   ├── deploy_schema.py      # Automated, idempotent schema deployment
 │   └── eod_ingest.py         # Data ingestion CLI (prices, instruments, actions)
 ├── sql/
-│   └── boot/
+│   └── patch/
 │       └── 001_eod_schema.sql
 └── doc/
     └── README.md
@@ -36,9 +36,9 @@ pip install yfinance
 python src/eod_ingest.py enrich
 ```
 
-## Adding migrations
+## Adding patches
 
-Create new files in `sql/boot/` following the naming convention:
+Create new files in `sql/patch/` following the naming convention:
 
 ```
 002_add_watchlist.sql
@@ -49,7 +49,7 @@ Each file must be idempotent (use `IF NOT EXISTS`, `CREATE OR REPLACE`,
 `ON CONFLICT DO NOTHING`, `DO $$ ... EXCEPTION ... $$` blocks).
 
 Run `python src/deploy_schema.py` — it skips already-applied versions,
-applies only new ones, and records each successful migration in
+applies only new ones, and records each successful patch in
 `schema_version`.
 
 ## Environment variables
@@ -58,4 +58,4 @@ applies only new ones, and records each successful migration in
 |----------------------|----------------------------------------------|
 | `EOD_ENV`            | `dev` (`cfg/dev.env`; `prod` uses `cfg/prod.env`) |
 | `EOD_DSN`            | Overrides `cfg/<env>.env` when set            |
-| `EOD_MIGRATIONS_DIR` | `./sql/boot`                                  |
+| `EOD_PATCH_DIR`      | `./sql/patch`                                 |

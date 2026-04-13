@@ -138,17 +138,6 @@ def auto_add_instruments(
     if not new_syms:
         return sym_map
 
-    with conn.cursor() as cur:
-        for sym in sorted(new_syms):
-            cur.execute(
-                """INSERT INTO instrument (symbol, name, exchange, currency)
-                   VALUES (%s, %s, %s, %s)
-                   ON CONFLICT (symbol) DO NOTHING
-                   RETURNING instrument_id""",
-                (sym, f"[{sym}]", exchange, currency),
-            )
-            cur.fetchone()
-
     # Do not commit inside this helper.
     #
     # `prices` needs stub creation and price upserts to behave like one atomic
@@ -161,10 +150,22 @@ def auto_add_instruments(
     # By leaving the transaction open, the caller can commit only after the
     # actual ingest succeeds, and psycopg will roll everything back together if
     # an exception escapes the surrounding connection context.
-    updated_map = load_symbol_map(conn)
-    created_syms = sorted(set(updated_map) - set(sym_map))
+    with conn.cursor() as cur:
+        for sym in sorted(new_syms):
+            cur.execute(
+                """INSERT INTO instrument (symbol, name, exchange, currency)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (symbol) DO NOTHING
+                   RETURNING instrument_id""",
+                (sym, f"[{sym}]", exchange, currency),
+            )
+            row = cur.fetchone()
+            if row:
+                sym_map[sym] = row[0]
+
+    created_syms = sorted(new_syms & set(sym_map))
     print(f"✓ Auto-created {len(created_syms)} instrument stub(s): {created_syms}")
-    return updated_map
+    return sym_map
 
 
 def read_csv_prices(path: Path) -> tuple[list[PriceRow], list[tuple[int, str]]]:
@@ -375,15 +376,16 @@ def cmd_add_instrument(args):
     with psycopg.connect(args.dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO instrument (symbol, name, instrument_type, currency, sector)
-                   VALUES (%s, %s, %s, %s, %s)
+                """INSERT INTO instrument (symbol, name, exchange, instrument_type, currency, sector)
+                   VALUES (%s, %s, %s, %s, %s, %s)
                    ON CONFLICT (symbol) DO UPDATE SET
                        name = EXCLUDED.name,
+                       exchange = EXCLUDED.exchange,
                        instrument_type = EXCLUDED.instrument_type,
                        currency = EXCLUDED.currency,
                        sector = EXCLUDED.sector
                    RETURNING instrument_id""",
-                (args.symbol.upper(), args.name, args.type, args.currency, args.sector),
+                (args.symbol.upper(), args.name, args.exchange, args.type, args.currency, args.sector),
             )
             iid = cur.fetchone()[0]
         conn.commit()
@@ -560,6 +562,7 @@ examples:
     p_add = sub.add_parser("add-instrument", help="Add or update a single instrument")
     p_add.add_argument("symbol")
     p_add.add_argument("name")
+    p_add.add_argument("--exchange", default="ASX")
     p_add.add_argument("--type", default="equity", choices=["equity", "etf", "reit", "index"])
     p_add.add_argument("--currency", default="AUD")
     p_add.add_argument("--sector", default=None)

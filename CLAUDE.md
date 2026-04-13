@@ -6,16 +6,16 @@ data. See `doc/README.md` for user-facing setup and usage instructions.
 ## Project structure
 
 ```
-src/deploy_schema.py   — idempotent migration runner
+src/deploy_schema.py   — idempotent patch runner
 src/eod_ingest.py      — ingestion CLI (prices, instruments, corporate actions)
-sql/boot/              — numbered migration files (001_eod_schema.sql, …)
+sql/patch/             — numbered patch files (001_eod_schema.sql, …)
 cfg/dev.env            — default DSN for local development (tracked, no creds)
 ```
 
 ## Running the tools
 
 ```bash
-# Apply pending migrations (creates DB if needed)
+# Apply pending patches (creates DB if needed)
 python src/deploy_schema.py --create-db
 
 # Verify schema without changing anything
@@ -34,10 +34,10 @@ python src/eod_ingest.py enrich
 
 ## Non-obvious invariants — do not break these
 
-### Migrations must be idempotent
-Every statement in `sql/boot/*.sql` must be safe to re-run against an already
-migrated database. Use `IF NOT EXISTS`, `CREATE OR REPLACE`, `ON CONFLICT DO
-NOTHING`, and `DO $$ … EXCEPTION … $$` blocks. Never write a migration that
+### Patches must be idempotent
+Every statement in `sql/patch/*.sql` must be safe to re-run against an already
+patched database. Use `IF NOT EXISTS`, `CREATE OR REPLACE`, `ON CONFLICT DO
+NOTHING`, and `DO $$ … EXCEPTION … $$` blocks. Never write a patch that
 fails on a second run.
 
 ### No foreign key on eod_price.instrument_id

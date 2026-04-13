@@ -1,5 +1,5 @@
 -- ============================================================================
--- Compact EOD Schema — IDEMPOTENT MIGRATION
+-- Compact EOD Schema — IDEMPOTENT PATCH
 -- Safe to run repeatedly against the same database.
 --
 -- PostgreSQL >= 18  +  TimescaleDB >= 2.11
