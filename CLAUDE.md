@@ -21,8 +21,11 @@ python src/deploy_schema.py --create-db
 # Verify schema without changing anything
 python src/deploy_schema.py --check
 
-# Drop and fully recreate the database (prompts for confirmation)
+# Drop the database only (prompts for confirmation)
 python src/deploy_schema.py --drop-db
+
+# Drop, recreate, and re-apply all patches (prompts for confirmation)
+python src/deploy_schema.py --reset-db
 
 # Ingest EOD prices from CSV
 python src/eod_ingest.py prices data/2026-04-09.csv

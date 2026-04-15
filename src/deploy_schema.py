@@ -13,6 +13,8 @@ Usage:
     python src/deploy_schema.py --patch ./sql/patch
     python src/deploy_schema.py --check      # verify only, don't apply
     python src/deploy_schema.py --create-db  # create database if missing
+    python src/deploy_schema.py --drop-db    # drop database only
+    python src/deploy_schema.py --reset-db   # drop, recreate, and patch
 
 Environment variables (override defaults):
     EOD_ENV          dev|prod   (selects cfg/<env>.env, default: dev)
@@ -254,76 +256,72 @@ def ensure_timescaledb_available(conn: psycopg.Connection):
 
 
 def verify_schema(conn: psycopg.Connection) -> dict:
-    """Check that core objects exist and return a status report."""
+    """Discover and report all schema objects present in the public schema."""
     checks = {}
 
     with conn.cursor(row_factory=dict_row) as cur:
-        # Tables
-        for table in ["instrument", "eod_price", "corporate_action", "schema_version"]:
-            cur.execute("""
-                SELECT EXISTS (
-                    SELECT 1 FROM information_schema.tables
-                     WHERE table_schema = 'public' AND table_name = %s
-                )
-            """, (table,))
-            checks[f"table:{table}"] = cur.fetchone()["exists"]
+        # PostgreSQL version
+        cur.execute("SELECT version()")
+        checks["pg_version"] = cur.fetchone()["version"]
 
         # TimescaleDB version
         cur.execute("SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'")
         row = cur.fetchone()
         checks["timescaledb_version"] = row["extversion"] if row else "NOT INSTALLED"
 
-        # PostgreSQL version
-        cur.execute("SELECT version()")
-        checks["pg_version"] = cur.fetchone()["version"]
+        # All tables in public schema (discovered, not hardcoded)
+        cur.execute("""
+            SELECT table_name
+              FROM information_schema.tables
+             WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+             ORDER BY table_name
+        """)
+        for r in cur.fetchall():
+            checks[f"table:{r['table_name']}"] = True
 
+        # All views in public schema (discovered, not hardcoded)
+        cur.execute("""
+            SELECT table_name
+              FROM information_schema.views
+             WHERE table_schema = 'public'
+             ORDER BY table_name
+        """)
+        for r in cur.fetchall():
+            checks[f"view:{r['table_name']}"] = True
+
+        # All indexes in public schema (discovered, not hardcoded)
+        cur.execute("""
+            SELECT indexname
+              FROM pg_indexes
+             WHERE schemaname = 'public'
+             ORDER BY indexname
+        """)
+        for r in cur.fetchall():
+            checks[f"index:{r['indexname']}"] = True
+
+        # TimescaleDB hypertables and their compression state
         if row:
-            # Hypertable
             cur.execute("""
-                SELECT EXISTS (
-                    SELECT 1 FROM timescaledb_information.hypertables
-                     WHERE hypertable_name = 'eod_price'
-                )
-            """)
-            checks["hypertable:eod_price"] = cur.fetchone()["exists"]
-
-            # Compression
-            cur.execute("""
-                SELECT compression_enabled
+                SELECT hypertable_name, compression_enabled
                   FROM timescaledb_information.hypertables
-                 WHERE hypertable_name = 'eod_price'
+                 WHERE hypertable_schema = 'public'
+                 ORDER BY hypertable_name
             """)
-            hypertable = cur.fetchone()
-            checks["compression:eod_price"] = (
-                hypertable["compression_enabled"] if hypertable else False
-            )
-        else:
-            checks["hypertable:eod_price"] = False
-            checks["compression:eod_price"] = False
+            for r in cur.fetchall():
+                checks[f"hypertable:{r['hypertable_name']}"] = True
+                checks[f"compression:{r['hypertable_name']}"] = r["compression_enabled"]
 
-        # Views
-        for view in ["v_latest_price", "v_adjustment_factor", "v_cumulative_factor",
-                      "v_adjusted_price", "v_daily_return"]:
-            cur.execute("""
-                SELECT EXISTS (
-                    SELECT 1 FROM information_schema.views
-                     WHERE table_schema = 'public' AND table_name = %s
-                )
-            """, (view,))
-            checks[f"view:{view}"] = cur.fetchone()["exists"]
-
-        # Indexes
-        for idx in ["idx_eod_pk", "idx_eod_date", "idx_corpact"]:
-            cur.execute("""
-                SELECT EXISTS (
-                    SELECT 1 FROM pg_indexes
-                     WHERE schemaname = 'public' AND indexname = %s
-                )
-            """, (idx,))
-            checks[f"index:{idx}"] = cur.fetchone()["exists"]
-
-        # Row counts
-        for table in ["instrument", "eod_price", "corporate_action"]:
+        # Row counts for all user tables (excludes schema_version)
+        cur.execute("""
+            SELECT table_name
+              FROM information_schema.tables
+             WHERE table_schema = 'public'
+               AND table_type = 'BASE TABLE'
+               AND table_name <> 'schema_version'
+             ORDER BY table_name
+        """)
+        user_tables = [r["table_name"] for r in cur.fetchall()]
+        for table in user_tables:
             cur.execute(psycopg.sql.SQL("SELECT count(*) AS n FROM {}").format(
                 psycopg.sql.Identifier(table)
             ))
@@ -389,9 +387,10 @@ def main():
 examples:
   %(prog)s                                     # apply pending patches
   %(prog)s --create-db                         # create DB first if needed
-  %(prog)s --drop-db                           # drop, recreate, and patch
+  %(prog)s --drop-db                           # drop DB only (no recreate)
+  %(prog)s --reset-db                          # drop, recreate, and patch
   %(prog)s --check                             # verify schema, don't change
-  %(prog)s --dsn postgresql://prod:5432/mktdata
+  %(prog)s --dsn postgresql://prod:5433/tcdata
   %(prog)s --patch /opt/eod/sql/patch
         """,
     )
@@ -401,6 +400,8 @@ examples:
     parser.add_argument("--create-db", action="store_true",
                         help="Create the database if it doesn't exist")
     parser.add_argument("--drop-db", action="store_true",
+                        help="Drop the database if it exists (no recreate)")
+    parser.add_argument("--reset-db", action="store_true",
                         help="Drop the database if it exists, recreate it, then run all patches")
     parser.add_argument("--check", action="store_true",
                         help="Verify schema only, don't apply patches")
@@ -409,8 +410,18 @@ examples:
     patch_dir = Path(args.patch)
     server_dsn, dbname = parse_dsn(args.dsn)
 
-    # ── Drop + recreate if requested ──
+    # ── Drop only ──
     if args.drop_db:
+        print(f"WARNING: about to drop '{dbname}' — all data will be lost.")
+        confirm = input("Type the database name to confirm: ").strip()
+        if confirm != dbname:
+            print("Aborted.", file=sys.stderr)
+            sys.exit(1)
+        drop_database(server_dsn, dbname)
+        return
+
+    # ── Drop + recreate + patch ──
+    if args.reset_db:
         print(f"WARNING: about to drop and recreate '{dbname}' — all data will be lost.")
         confirm = input("Type the database name to confirm: ").strip()
         if confirm != dbname:
