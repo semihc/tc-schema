@@ -15,6 +15,11 @@ Usage:
     python src/deploy_schema.py --create-db  # create database if missing
     python src/deploy_schema.py --drop-db    # drop database only
     python src/deploy_schema.py --reset-db   # drop, recreate, and patch
+    python src/deploy_schema.py --export dump.pgc               # full dump
+    python src/deploy_schema.py --export dump.pgc --schema-only
+    python src/deploy_schema.py --export dump.pgc --data-only
+    python src/deploy_schema.py --import dump.pgc               # full restore
+    python src/deploy_schema.py --import dump.pgc --data-only
 
 Environment variables (override defaults):
     EOD_ENV          dev|prod   (selects cfg/<env>.env, default: dev)
@@ -27,6 +32,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -377,6 +383,66 @@ def print_verification(checks: dict):
     print()
 
 
+# ── Export / Import ──────────────────────────────────────────────────────────
+
+# TimescaleDB manages these schemas internally — they are recreated by the
+# extension on restore and must not be included in any dump.
+_TSDB_EXCLUDE_SCHEMAS = [
+    "_timescaledb_catalog",
+    "_timescaledb_config",
+    "_timescaledb_internal",
+    "timescaledb_experimental",
+    "timescaledb_information",
+]
+
+
+def cmd_export(dsn: str, output_path: Path, schema_only: bool, data_only: bool):
+    """Dump the database to a pg_dump custom-format file."""
+    cmd = ["pg_dump", "--format=custom", f"--file={output_path}"]
+    if schema_only:
+        cmd.append("--schema-only")
+    elif data_only:
+        cmd.append("--data-only")
+    for schema in _TSDB_EXCLUDE_SCHEMAS:
+        cmd.append(f"--exclude-schema={schema}")
+    cmd.append(dsn)
+
+    mode = "schema-only" if schema_only else "data-only" if data_only else "full"
+    print(f"Exporting ({mode}) → {output_path} ...")
+    subprocess.run(cmd, check=True)
+    print(f"✓ Export complete.")
+
+
+def cmd_import(dsn: str, input_path: Path, schema_only: bool, data_only: bool):
+    """Restore a pg_dump custom-format file into the database.
+
+    For restores that include data, PGOPTIONS is set to enable
+    timescaledb.restoring=on so that TimescaleDB hypertable chunks are
+    written directly without the extension intercepting INSERT routing.
+    """
+    if not input_path.exists():
+        print(f"Import file not found: {input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    cmd = ["pg_restore", "--dbname", dsn]
+    if schema_only:
+        cmd.append("--schema-only")
+    elif data_only:
+        cmd.append("--data-only")
+    cmd.append(str(input_path))
+
+    env = os.environ.copy()
+    if not schema_only:
+        # Required for TimescaleDB: bypasses hypertable routing during bulk load
+        # so chunk data lands in the correct internal tables without conflicts.
+        env["PGOPTIONS"] = "-c timescaledb.restoring=on"
+
+    mode = "schema-only" if schema_only else "data-only" if data_only else "full"
+    print(f"Importing ({mode}) ← {input_path} ...")
+    subprocess.run(cmd, check=True, env=env)
+    print(f"✓ Import complete.")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -390,6 +456,11 @@ examples:
   %(prog)s --drop-db                           # drop DB only (no recreate)
   %(prog)s --reset-db                          # drop, recreate, and patch
   %(prog)s --check                             # verify schema, don't change
+  %(prog)s --export dump.pgc                   # full dump (schema + data)
+  %(prog)s --export dump.pgc --schema-only     # schema objects only
+  %(prog)s --export dump.pgc --data-only       # table data only
+  %(prog)s --import dump.pgc                   # full restore
+  %(prog)s --import dump.pgc --data-only       # restore data only
   %(prog)s --dsn postgresql://prod:5433/tcdata
   %(prog)s --patch /opt/eod/sql/patch
         """,
@@ -405,7 +476,26 @@ examples:
                         help="Drop the database if it exists, recreate it, then run all patches")
     parser.add_argument("--check", action="store_true",
                         help="Verify schema only, don't apply patches")
+    parser.add_argument("--export", metavar="FILE",
+                        help="Dump database to FILE using pg_dump (custom format)")
+    parser.add_argument("--import", dest="import_file", metavar="FILE",
+                        help="Restore database from FILE using pg_restore")
+    modality = parser.add_mutually_exclusive_group()
+    modality.add_argument("--schema-only", action="store_true",
+                          help="With --export/--import: schema objects only, no data")
+    modality.add_argument("--data-only", action="store_true",
+                          help="With --export/--import: table data only, no schema")
     args = parser.parse_args()
+
+    # ── Export ──
+    if args.export:
+        cmd_export(args.dsn, Path(args.export), args.schema_only, args.data_only)
+        return
+
+    # ── Import ──
+    if args.import_file:
+        cmd_import(args.dsn, Path(args.import_file), args.schema_only, args.data_only)
+        return
 
     patch_dir = Path(args.patch)
     server_dsn, dbname = parse_dsn(args.dsn)
