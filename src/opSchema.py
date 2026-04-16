@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-deploy_schema.py — Automated, idempotent schema deployment.
+opSchema.py — Automated, idempotent schema deployment.
 
 Creates the database if it doesn't exist, runs all numbered patch
 files in order, skips already-applied versions.
@@ -8,18 +8,18 @@ files in order, skips already-applied versions.
 Dependencies:  pip install psycopg[binary]
 
 Usage:
-    python src/deploy_schema.py
-    python src/deploy_schema.py --dsn "postgresql://user:pw@host:5433/tcdata"
-    python src/deploy_schema.py --patch ./sql/patch
-    python src/deploy_schema.py --check      # verify only, don't apply
-    python src/deploy_schema.py --create-db  # create database if missing
-    python src/deploy_schema.py --drop-db    # drop database only
-    python src/deploy_schema.py --reset-db   # drop, recreate, and patch
-    python src/deploy_schema.py --export dump.pgc               # full dump
-    python src/deploy_schema.py --export dump.pgc --schema-only
-    python src/deploy_schema.py --export dump.pgc --data-only
-    python src/deploy_schema.py --import dump.pgc               # full restore
-    python src/deploy_schema.py --import dump.pgc --data-only
+    python src/opSchema.py
+    python src/opSchema.py --dsn "postgresql://user:pw@host:5433/tcdata"
+    python src/opSchema.py --patch ./sql/patch
+    python src/opSchema.py --check      # verify only, don't apply
+    python src/opSchema.py --create-db  # create database if missing
+    python src/opSchema.py --drop-db    # drop database only
+    python src/opSchema.py --reset-db   # drop, recreate, and patch
+    python src/opSchema.py --export dump.pgc               # full dump
+    python src/opSchema.py --export dump.pgc --schema-only
+    python src/opSchema.py --export dump.pgc --data-only
+    python src/opSchema.py --import dump.pgc               # full restore
+    python src/opSchema.py --import dump.pgc --data-only
 
 Environment variables (override defaults):
     EOD_ENV          dev|prod   (selects cfg/<env>.env, default: dev)
@@ -52,7 +52,7 @@ DEFAULT_PATCH_DIR = os.environ.get(
 
 DEFAULT_DSN_FALLBACK = "postgresql://localhost:5433/tcdata"
 
-# Patch files must match: NNN_description.sql  (e.g. 001_eod_schema.sql)
+# Patch files must match: NNN_description.sql  (e.g. 001_schema.sql)
 PATCH_PATTERN = re.compile(r"^(\d{3})_.+\.sql$")
 
 
@@ -68,7 +68,7 @@ class Patch:
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def load_simple_env_file(path: Path) -> dict[str, str]:
+def loadSimpleEnvFile(path: Path) -> dict[str, str]:
     """Read KEY=VALUE pairs from a small .env file.
 
     This loader is intentionally minimal because the project config files are
@@ -91,11 +91,11 @@ def load_simple_env_file(path: Path) -> dict[str, str]:
     return values
 
 
-def resolve_default_dsn() -> str:
+def resolveDefaultDsn() -> str:
     """Resolve the default DSN from cfg/<env>.env, then env vars, then fallback."""
     env_name = DEFAULT_ENV
     env_file = PROJECT_ROOT / "cfg" / f"{env_name}.env"
-    file_values = load_simple_env_file(env_file)
+    file_values = loadSimpleEnvFile(env_file)
 
     # Default DSN should come from the selected config file so local runs pick
     # up the repo's dev/prod conventions without requiring a long CLI flag.
@@ -108,9 +108,9 @@ def resolve_default_dsn() -> str:
     )
 
 
-DEFAULT_DSN = resolve_default_dsn()
+DEFAULT_DSN = resolveDefaultDsn()
 
-def parse_dsn(dsn: str) -> tuple[str, str]:
+def parseDsn(dsn: str) -> tuple[str, str]:
     """Extract (server_dsn, dbname) from a full DSN.
     server_dsn connects to 'postgres' db for admin operations."""
     # Simple extraction — handles postgresql://user:pass@host:port/dbname
@@ -123,7 +123,7 @@ def parse_dsn(dsn: str) -> tuple[str, str]:
     return dsn, "tcdata"
 
 
-def discover_patches(directory: Path) -> list[Patch]:
+def discoverPatches(directory: Path) -> list[Patch]:
     """Find and sort patch files."""
     if not directory.is_dir():
         print(f"Patch directory not found: {directory}", file=sys.stderr)
@@ -145,7 +145,7 @@ def discover_patches(directory: Path) -> list[Patch]:
     return sorted(patches, key=lambda p: p.version)
 
 
-def database_exists(server_dsn: str, dbname: str) -> bool:
+def databaseExists(server_dsn: str, dbname: str) -> bool:
     with psycopg.connect(server_dsn, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -154,7 +154,7 @@ def database_exists(server_dsn: str, dbname: str) -> bool:
             return cur.fetchone() is not None
 
 
-def create_database(server_dsn: str, dbname: str):
+def createDatabase(server_dsn: str, dbname: str):
     with psycopg.connect(server_dsn, autocommit=True) as conn:
         with conn.cursor() as cur:
             # Use format() not %s — CREATE DATABASE doesn't support params
@@ -166,7 +166,7 @@ def create_database(server_dsn: str, dbname: str):
     print(f"✓ Created database: {dbname}")
 
 
-def drop_database(server_dsn: str, dbname: str):
+def dropDatabase(server_dsn: str, dbname: str):
     with psycopg.connect(server_dsn, autocommit=True) as conn:
         with conn.cursor() as cur:
             # Terminate active connections first so DROP DATABASE doesn't block.
@@ -185,7 +185,7 @@ def drop_database(server_dsn: str, dbname: str):
     print(f"✓ Dropped database: {dbname}")
 
 
-def get_applied_versions(conn: psycopg.Connection) -> set[int]:
+def getAppliedVersions(conn: psycopg.Connection) -> set[int]:
     """Return set of already-applied patch versions."""
     with conn.cursor() as cur:
         # Check if schema_version table exists
@@ -206,7 +206,7 @@ def get_applied_versions(conn: psycopg.Connection) -> set[int]:
             return set()
 
 
-def apply_patch(conn: psycopg.Connection, patch: Patch):
+def applyPatch(conn: psycopg.Connection, patch: Patch):
     """Execute a single patch file."""
     sql = patch.path.read_text(encoding="utf-8")
     with conn.cursor() as cur:
@@ -223,7 +223,7 @@ def apply_patch(conn: psycopg.Connection, patch: Patch):
     conn.commit()
 
 
-def get_available_extension_version(conn: psycopg.Connection, name: str) -> str | None:
+def getAvailableExtensionVersion(conn: psycopg.Connection, name: str) -> str | None:
     """Return the installable version for an extension, or None if unavailable."""
     with conn.cursor() as cur:
         cur.execute(
@@ -238,9 +238,9 @@ def get_available_extension_version(conn: psycopg.Connection, name: str) -> str 
         return row[0] if row else None
 
 
-def ensure_timescaledb_available(conn: psycopg.Connection):
+def ensureTimescaledbAvailable(conn: psycopg.Connection):
     """Fail early with a friendly message if TimescaleDB is not installed."""
-    available_version = get_available_extension_version(conn, "timescaledb")
+    available_version = getAvailableExtensionVersion(conn, "timescaledb")
     if available_version:
         return
 
@@ -261,7 +261,7 @@ def ensure_timescaledb_available(conn: psycopg.Connection):
     sys.exit(1)
 
 
-def verify_schema(conn: psycopg.Connection) -> dict:
+def verifySchema(conn: psycopg.Connection) -> dict:
     """Discover and report all schema objects present in the public schema."""
     checks = {}
 
@@ -344,7 +344,7 @@ def verify_schema(conn: psycopg.Connection) -> dict:
     return checks
 
 
-def print_verification(checks: dict):
+def printVerification(checks: dict):
     print("\n── Schema verification ──────────────────────────────")
     print(f"  PostgreSQL:   {checks['pg_version']}")
     print(f"  TimescaleDB:  {checks['timescaledb_version']}")
@@ -396,7 +396,7 @@ _TSDB_EXCLUDE_SCHEMAS = [
 ]
 
 
-def cmd_export(dsn: str, output_path: Path, schema_only: bool, data_only: bool):
+def cmdExport(dsn: str, output_path: Path, schema_only: bool, data_only: bool):
     """Dump the database to a pg_dump custom-format file."""
     cmd = ["pg_dump", "--format=custom", f"--file={output_path}"]
     if schema_only:
@@ -413,7 +413,7 @@ def cmd_export(dsn: str, output_path: Path, schema_only: bool, data_only: bool):
     print(f"✓ Export complete.")
 
 
-def cmd_import(dsn: str, input_path: Path, schema_only: bool, data_only: bool):
+def cmdImport(dsn: str, input_path: Path, schema_only: bool, data_only: bool):
     """Restore a pg_dump custom-format file into the database.
 
     For restores that include data, PGOPTIONS is set to enable
@@ -489,16 +489,16 @@ examples:
 
     # ── Export ──
     if args.export:
-        cmd_export(args.dsn, Path(args.export), args.schema_only, args.data_only)
+        cmdExport(args.dsn, Path(args.export), args.schema_only, args.data_only)
         return
 
     # ── Import ──
     if args.import_file:
-        cmd_import(args.dsn, Path(args.import_file), args.schema_only, args.data_only)
+        cmdImport(args.dsn, Path(args.import_file), args.schema_only, args.data_only)
         return
 
     patch_dir = Path(args.patch)
-    server_dsn, dbname = parse_dsn(args.dsn)
+    server_dsn, dbname = parseDsn(args.dsn)
 
     # ── Drop only ──
     if args.drop_db:
@@ -507,7 +507,7 @@ examples:
         if confirm != dbname:
             print("Aborted.", file=sys.stderr)
             sys.exit(1)
-        drop_database(server_dsn, dbname)
+        dropDatabase(server_dsn, dbname)
         return
 
     # ── Drop + recreate + patch ──
@@ -517,32 +517,32 @@ examples:
         if confirm != dbname:
             print("Aborted.", file=sys.stderr)
             sys.exit(1)
-        drop_database(server_dsn, dbname)
-        create_database(server_dsn, dbname)
+        dropDatabase(server_dsn, dbname)
+        createDatabase(server_dsn, dbname)
 
     # ── Create database if requested ──
     elif args.create_db:
-        if database_exists(server_dsn, dbname):
+        if databaseExists(server_dsn, dbname):
             print(f"Database '{dbname}' already exists.")
         else:
-            create_database(server_dsn, dbname)
+            createDatabase(server_dsn, dbname)
 
     # ── Check mode ──
     if args.check:
         try:
             with psycopg.connect(args.dsn) as conn:
-                checks = verify_schema(conn)
-                print_verification(checks)
+                checks = verifySchema(conn)
+                printVerification(checks)
         except psycopg.OperationalError as e:
             print(f"Cannot connect: {e}", file=sys.stderr)
             sys.exit(1)
         return
 
     # ── Discover patches ──
-    patches = discover_patches(patch_dir)
+    patches = discoverPatches(patch_dir)
     if not patches:
         print(f"No patch files found in {patch_dir}", file=sys.stderr)
-        print(f"Expected files like: 001_eod_schema.sql", file=sys.stderr)
+        print(f"Expected files like: 001_schema.sql", file=sys.stderr)
         sys.exit(1)
 
     print(f"Found {len(patches)} patch(es) in {patch_dir}")
@@ -553,9 +553,9 @@ examples:
             # Preflight the server before we start running patch files.
             # This gives a much clearer failure than letting the first patch
             # abort inside `CREATE EXTENSION timescaledb`.
-            ensure_timescaledb_available(conn)
+            ensureTimescaledbAvailable(conn)
 
-            applied = get_applied_versions(conn)
+            applied = getAppliedVersions(conn)
             pending = [p for p in patches if p.version not in applied]
 
             if not pending:
@@ -564,12 +564,12 @@ examples:
                 print(f"Applying {len(pending)} pending patch(es)...")
                 for p in pending:
                     print(f"  → v{p.version:03d}  {p.description} ({p.filename})")
-                    apply_patch(conn, p)
+                    applyPatch(conn, p)
                     print(f"    ✓ applied")
 
             # Verify
-            checks = verify_schema(conn)
-            print_verification(checks)
+            checks = verifySchema(conn)
+            printVerification(checks)
 
     except psycopg.OperationalError as e:
         print(f"Cannot connect: {e}", file=sys.stderr)

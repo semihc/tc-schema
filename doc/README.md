@@ -7,11 +7,11 @@ PostgreSQL 18 + TimescaleDB schema for private investors.
 ```
 tc-schema/
 ├── src/
-│   ├── deploy_schema.py      # Automated, idempotent schema deployment
-│   └── eod_ingest.py         # Data ingestion CLI (prices, instruments, actions)
+│   ├── opSchema.py           # Automated, idempotent schema deployment
+│   └── loadEodData.py        # Data ingestion CLI (prices, instruments, actions)
 ├── sql/
 │   └── patch/
-│       └── 001_eod_schema.sql
+│       └── 001_schema.sql
 └── doc/
     └── README.md
 ```
@@ -23,17 +23,17 @@ pip install psycopg[binary]
 
 # 1. Create database and apply schema
 # By default the script reads EOD_DSN from cfg/dev.env.
-python src/deploy_schema.py --create-db
+python src/opSchema.py --create-db
 
 # 2. Verify
-python src/deploy_schema.py --check
+python src/opSchema.py --check
 
 # 3. Ingest prices (instruments auto-created)
-python src/eod_ingest.py prices data/2026-04-09.csv
+python src/loadEodData.py prices data/2026-04-09.csv
 
 # 4. Backfill metadata from Yahoo Finance
 pip install yfinance
-python src/eod_ingest.py enrich
+python src/loadEodData.py enrich
 ```
 
 ## Adding patches
@@ -41,14 +41,14 @@ python src/eod_ingest.py enrich
 Create new files in `sql/patch/` following the naming convention:
 
 ```
-002_add_watchlist.sql
-003_add_portfolio_table.sql
+002_addWatchlist.sql
+003_addPortfolioTable.sql
 ```
 
 Each file must be idempotent (use `IF NOT EXISTS`, `CREATE OR REPLACE`,
 `ON CONFLICT DO NOTHING`, `DO $$ ... EXCEPTION ... $$` blocks).
 
-Run `python src/deploy_schema.py` — it skips already-applied versions,
+Run `python src/opSchema.py` — it skips already-applied versions,
 applies only new ones, and records each successful patch in
 `schema_version`.
 

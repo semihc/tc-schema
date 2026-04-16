@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-eod_ingest.py — Compact EOD ingestion for private investors.
+loadEodData.py — Load/ingest EOD data.
 
 No pandas dependency — uses only stdlib csv + psycopg.
 
@@ -17,10 +17,10 @@ Dependencies:  pip install psycopg[binary]
 Optional:      pip install yfinance   (only needed for 'enrich' subcommand)
 
 Usage:
-    python src/eod_ingest.py prices data/2026-04-09.csv
-    python src/eod_ingest.py prices data/2026-04-09.csv --no-auto-add
-    python src/eod_ingest.py enrich
-    python src/eod_ingest.py enrich --symbol BHP
+    python src/loadEodData.py prices data/2026-04-09.csv
+    python src/loadEodData.py prices data/2026-04-09.csv --no-auto-add
+    python src/loadEodData.py enrich
+    python src/loadEodData.py enrich --symbol BHP
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ _DEFAULT_ENV  = os.environ.get("EOD_ENV", "dev")
 _DSN_FALLBACK = "postgresql://localhost:5433/tcdata"
 
 
-def _load_simple_env_file(path: Path) -> dict[str, str]:
+def _loadSimpleEnvFile(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.exists():
         return values
@@ -58,18 +58,18 @@ def _load_simple_env_file(path: Path) -> dict[str, str]:
     return values
 
 
-def _resolve_dsn() -> str:
+def _resolveDsn() -> str:
     """Resolve DSN from cfg/<env>.env → EOD_DSN env var → hardcoded fallback.
 
-    Mirrors the resolution logic in deploy_schema.py so both tools use the
+    Mirrors the resolution logic in opSchema.py so both tools use the
     same default connection without requiring a --dsn flag on every invocation.
     """
     env_file   = _PROJECT_ROOT / "cfg" / f"{_DEFAULT_ENV}.env"
-    file_values = _load_simple_env_file(env_file)
+    file_values = _loadSimpleEnvFile(env_file)
     return os.environ.get("EOD_DSN", file_values.get("EOD_DSN", _DSN_FALLBACK))
 
 
-DSN = _resolve_dsn()
+DSN = _resolveDsn()
 
 YAHOO_TYPE_MAP = {
     "EQUITY": "equity",
@@ -92,7 +92,7 @@ class PriceRow:
     volume: int
 
     @classmethod
-    def from_csv(cls, row: dict[str, str]) -> PriceRow:
+    def fromCsv(cls, row: dict[str, str]) -> PriceRow:
         """Parse a CSV dict row. Raises ValueError on bad data."""
         return cls(
             symbol=row["symbol"].upper().strip(),
@@ -104,7 +104,7 @@ class PriceRow:
             volume=int(float(row["volume"])),  # int(float()) handles "1000.0"
         )
 
-    def is_valid(self) -> bool:
+    def isValid(self) -> bool:
         """OHLC sanity check."""
         return (
             self.high >= self.low
@@ -120,19 +120,19 @@ class PriceRow:
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def load_symbol_map(conn: psycopg.Connection) -> dict[str, int]:
+def loadSymbolMap(conn: psycopg.Connection) -> dict[str, int]:
     with conn.cursor() as cur:
         cur.execute("SELECT symbol, instrument_id FROM instrument")
         return dict(cur.fetchall())
 
 
-def auto_add_instruments(
+def autoAddInstruments(
     conn: psycopg.Connection,
     symbols: set[str],
     exchange: str = "ASX",
     currency: str = "AUD",
 ) -> dict[str, int]:
-    sym_map = load_symbol_map(conn)
+    sym_map = loadSymbolMap(conn)
     new_syms = symbols - set(sym_map)
 
     if not new_syms:
@@ -168,7 +168,7 @@ def auto_add_instruments(
     return sym_map
 
 
-def read_csv_prices(path: Path) -> tuple[list[PriceRow], list[tuple[int, str]]]:
+def readCsvPrices(path: Path) -> tuple[list[PriceRow], list[tuple[int, str]]]:
     """Read CSV, return (valid_rows, [(line_num, error_msg), ...])."""
     rows: list[PriceRow] = []
     errors: list[tuple[int, str]] = []
@@ -188,12 +188,12 @@ def read_csv_prices(path: Path) -> tuple[list[PriceRow], list[tuple[int, str]]]:
 
         for i, raw in enumerate(reader, start=2):  # line 1 is header
             try:
-                pr = PriceRow.from_csv(raw)
+                pr = PriceRow.fromCsv(raw)
             except (ValueError, KeyError) as e:
                 errors.append((i, f"parse error: {e}"))
                 continue
 
-            if not pr.is_valid():
+            if not pr.isValid():
                 errors.append((i, f"OHLC sanity failed: {pr.symbol} {pr.trade_date}"))
                 continue
 
@@ -215,13 +215,13 @@ DO UPDATE SET
 """
 
 
-def cmd_prices(args):
+def cmdPrices(args):
     path = Path(args.csv)
     if not path.exists():
         print(f"File not found: {path}", file=sys.stderr)
         sys.exit(1)
 
-    rows, errors = read_csv_prices(path)
+    rows, errors = readCsvPrices(path)
 
     if errors:
         print(f"⚠  {len(errors)} rows skipped:", file=sys.stderr)
@@ -250,9 +250,9 @@ def cmd_prices(args):
         # so we deliberately avoid intermediate commits before the final upsert
         # has succeeded.
         if args.auto_add:
-            sym_map = auto_add_instruments(conn, all_symbols, args.exchange, args.currency)
+            sym_map = autoAddInstruments(conn, all_symbols, args.exchange, args.currency)
         else:
-            sym_map = load_symbol_map(conn)
+            sym_map = loadSymbolMap(conn)
             unknown = all_symbols - set(sym_map)
             if unknown:
                 print(f"⚠  Unknown symbols (skipped): {sorted(unknown)}", file=sys.stderr)
@@ -285,7 +285,7 @@ def cmd_prices(args):
 
 # ── Enrichment from Yahoo Finance ────────────────────────────────────────────
 
-def fetch_yahoo_info(symbol: str, exchange: str = "ASX") -> dict | None:
+def fetchYahooInfo(symbol: str, exchange: str = "ASX") -> dict | None:
     try:
         import yfinance as yf
     except ImportError:
@@ -313,7 +313,7 @@ def fetch_yahoo_info(symbol: str, exchange: str = "ASX") -> dict | None:
     }
 
 
-def cmd_enrich(args):
+def cmdEnrich(args):
     with psycopg.connect(args.dsn, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
             if args.symbol:
@@ -338,7 +338,7 @@ def cmd_enrich(args):
 
         for row in stubs:
             sym = row["symbol"]
-            info = fetch_yahoo_info(sym, row["exchange"])
+            info = fetchYahooInfo(sym, row["exchange"])
 
             if info is None:
                 failed.append(sym)
@@ -372,7 +372,7 @@ def cmd_enrich(args):
 
 # ── Instrument management ───────────────────────────────────────────────────
 
-def cmd_add_instrument(args):
+def cmdAddInstrument(args):
     with psycopg.connect(args.dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -392,7 +392,7 @@ def cmd_add_instrument(args):
         print(f"✓ instrument_id={iid}  {args.symbol.upper()}  {args.name}")
 
 
-def cmd_list_instruments(args):
+def cmdListInstruments(args):
     with psycopg.connect(args.dsn, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -416,7 +416,7 @@ def cmd_list_instruments(args):
         )
 
 
-def cmd_import_instruments(args):
+def cmdImportInstruments(args):
     path = Path(args.csv)
     if not path.exists():
         print(f"File not found: {path}", file=sys.stderr)
@@ -454,7 +454,7 @@ def cmd_import_instruments(args):
 
 # ── Corporate action management ─────────────────────────────────────────────
 
-def cmd_add_action(args):
+def cmdAddAction(args):
     try:
         ex_date = date.fromisoformat(args.ex_date)
     except ValueError:
@@ -462,7 +462,7 @@ def cmd_add_action(args):
         sys.exit(1)
 
     with psycopg.connect(args.dsn) as conn:
-        sym_map = load_symbol_map(conn)
+        sym_map = loadSymbolMap(conn)
         sym = args.symbol.upper()
         if sym not in sym_map:
             print(f"Unknown symbol: {sym}", file=sys.stderr)
@@ -481,9 +481,9 @@ def cmd_add_action(args):
         print(f"✓ action_id={aid}  {sym}  {args.action_type}  factor={args.factor}  ex={args.ex_date}")
 
 
-def cmd_list_actions(args):
+def cmdListActions(args):
     with psycopg.connect(args.dsn, row_factory=dict_row) as conn:
-        sym_map = load_symbol_map(conn)
+        sym_map = loadSymbolMap(conn)
         sym = args.symbol.upper()
         if sym not in sym_map:
             print(f"Unknown symbol: {sym}", file=sys.stderr)
@@ -522,23 +522,23 @@ def main():
         epilog="""
 workflow:
   1. Ingest prices (instruments auto-created as stubs):
-       python src/eod_ingest.py prices data/2026-04-09.csv
+       python src/loadEodData.py prices data/2026-04-09.csv
 
   2. Backfill metadata from Yahoo Finance:
-       python src/eod_ingest.py enrich
+       python src/loadEodData.py enrich
 
   3. Record corporate actions as they happen:
-       python src/eod_ingest.py add-action BHP split 2.0 --ex-date 2026-06-01
+       python src/loadEodData.py add-action BHP split 2.0 --ex-date 2026-06-01
 
 examples:
-  python src/eod_ingest.py prices data/2026-04-09.csv
-  python src/eod_ingest.py prices data/2026-04-09.csv --no-auto-add
-  python src/eod_ingest.py prices data/2026-04-09.csv --exchange NYSE --currency USD
-  python src/eod_ingest.py enrich
-  python src/eod_ingest.py enrich --symbol BHP
-  python src/eod_ingest.py list-instruments
-  python src/eod_ingest.py add-action CBA dividend 2.10 --ex-date 2026-03-20
-  python src/eod_ingest.py list-actions BHP
+  python src/loadEodData.py prices data/2026-04-09.csv
+  python src/loadEodData.py prices data/2026-04-09.csv --no-auto-add
+  python src/loadEodData.py prices data/2026-04-09.csv --exchange NYSE --currency USD
+  python src/loadEodData.py enrich
+  python src/loadEodData.py enrich --symbol BHP
+  python src/loadEodData.py list-instruments
+  python src/loadEodData.py add-action CBA dividend 2.10 --ex-date 2026-03-20
+  python src/loadEodData.py list-actions BHP
         """,
     )
     parser.add_argument("--dsn", default=DSN, help="PostgreSQL connection string")
@@ -589,13 +589,13 @@ examples:
     args = parser.parse_args()
 
     dispatch = {
-        "prices": cmd_prices,
-        "enrich": cmd_enrich,
-        "add-instrument": cmd_add_instrument,
-        "list-instruments": cmd_list_instruments,
-        "import-instruments": cmd_import_instruments,
-        "add-action": cmd_add_action,
-        "list-actions": cmd_list_actions,
+        "prices": cmdPrices,
+        "enrich": cmdEnrich,
+        "add-instrument": cmdAddInstrument,
+        "list-instruments": cmdListInstruments,
+        "import-instruments": cmdImportInstruments,
+        "add-action": cmdAddAction,
+        "list-actions": cmdListActions,
     }
     dispatch[args.command](args)
 

@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS instrument (
 -- --------------------------------------------------------------------------
 -- NOTE: instrument_id carries no FOREIGN KEY constraint. TimescaleDB
 -- hypertables do not support FK constraints on the partitioned table itself.
--- Referential integrity is enforced at the application layer (eod_ingest.py).
+-- Referential integrity is enforced at the application layer (loadEodData.py).
 CREATE TABLE IF NOT EXISTS eod_price (
     trade_date      DATE          NOT NULL,
     instrument_id   INT           NOT NULL,

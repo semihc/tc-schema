@@ -6,9 +6,9 @@ data. See `doc/README.md` for user-facing setup and usage instructions.
 ## Project structure
 
 ```
-src/deploy_schema.py   — idempotent patch runner
-src/eod_ingest.py      — ingestion CLI (prices, instruments, corporate actions)
-sql/patch/             — numbered patch files (001_eod_schema.sql, …)
+src/opSchema.py        — idempotent patch runner
+src/loadEodData.py     — ingestion CLI (prices, instruments, corporate actions)
+sql/patch/             — numbered patch files (001_schema.sql, …)
 cfg/dev.env            — default DSN for local development (tracked, no creds)
 ```
 
@@ -16,23 +16,23 @@ cfg/dev.env            — default DSN for local development (tracked, no creds)
 
 ```bash
 # Apply pending patches (creates DB if needed)
-python src/deploy_schema.py --create-db
+python src/opSchema.py --create-db
 
 # Verify schema without changing anything
-python src/deploy_schema.py --check
+python src/opSchema.py --check
 
 # Drop the database only (prompts for confirmation)
-python src/deploy_schema.py --drop-db
+python src/opSchema.py --drop-db
 
 # Drop, recreate, and re-apply all patches (prompts for confirmation)
-python src/deploy_schema.py --reset-db
+python src/opSchema.py --reset-db
 
 # Ingest EOD prices from CSV
-python src/eod_ingest.py prices data/2026-04-09.csv
+python src/loadEodData.py prices data/2026-04-09.csv
 
 # Backfill instrument metadata from Yahoo Finance
 pip install yfinance
-python src/eod_ingest.py enrich
+python src/loadEodData.py enrich
 ```
 
 ## Non-obvious invariants — do not break these
@@ -46,12 +46,12 @@ fails on a second run.
 ### No foreign key on eod_price.instrument_id
 TimescaleDB hypertables do not support FK constraints on the partitioned table.
 The missing FK is intentional. Do not add one — it will fail at runtime.
-Referential integrity is enforced at the application layer in `eod_ingest.py`.
+Referential integrity is enforced at the application layer in `loadEodData.py`.
 
 ### Instrument stub creation and price upsert share one transaction
-In `cmd_prices`, auto-creating instrument stubs and upserting the prices that
-reference them must succeed or fail together. `auto_add_instruments` must not
-commit internally. The caller (`cmd_prices`) owns the single commit after both
+In `cmdPrices`, auto-creating instrument stubs and upserting the prices that
+reference them must succeed or fail together. `autoAddInstruments` must not
+commit internally. The caller (`cmdPrices`) owns the single commit after both
 writes succeed.
 
 ### DSN resolution order
@@ -71,4 +71,4 @@ It contains only a localhost DSN — no credentials. Real passwords must go in
 ## Dependencies
 
 - `psycopg[binary]` — required by both scripts
-- `yfinance` — optional, only needed for `eod_ingest.py enrich`
+- `yfinance` — optional, only needed for `loadEodData.py enrich`
