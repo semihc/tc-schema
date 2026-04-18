@@ -6,6 +6,7 @@ No pandas dependency — uses only stdlib csv + psycopg.
 
 Subcommands:
   prices             Upsert EOD prices from CSV (auto-creates unknown instruments)
+  import-eod         Upsert EOD prices from MetaStock daily format file
   add-instrument     Add or update a single instrument
   list-instruments   Show all registered instruments
   import-instruments Bulk import instruments from CSV
@@ -19,6 +20,7 @@ Optional:      pip install yfinance   (only needed for 'enrich' subcommand)
 Usage:
     python src/loadEodData.py prices data/2026-04-09.csv
     python src/loadEodData.py prices data/2026-04-09.csv --no-auto-add
+    python src/loadEodData.py import-eod data/20260417_MS-Format.txt
     python src/loadEodData.py enrich
     python src/loadEodData.py enrich --symbol BHP
 """
@@ -32,6 +34,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import psycopg
@@ -85,10 +88,10 @@ YAHOO_TYPE_MAP = {
 class PriceRow:
     symbol: str
     trade_date: date
-    open: float
-    high: float
-    low: float
-    close: float
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
     volume: int
 
     @classmethod
@@ -97,25 +100,35 @@ class PriceRow:
         return cls(
             symbol=row["symbol"].upper().strip(),
             trade_date=date.fromisoformat(row["trade_date"].strip()),
-            open=float(row["open"]),
-            high=float(row["high"]),
-            low=float(row["low"]),
-            close=float(row["close"]),
-            volume=int(float(row["volume"])),  # int(float()) handles "1000.0"
+            open=Decimal(row["open"].strip()),
+            high=Decimal(row["high"].strip()),
+            low=Decimal(row["low"].strip()),
+            close=Decimal(row["close"].strip()),
+            volume=int(Decimal(row["volume"].strip())),  # Decimal() handles "1000.0"
         )
 
+    def whyInvalid(self) -> str | None:
+        """Return the first OHLC constraint violation, or None if the row is valid."""
+        if self.open <= 0:
+            return f"open={self.open}"
+        if self.close <= 0:
+            return f"close={self.close}"
+        if self.high < self.low:
+            return f"high({self.high}) < low({self.low})"
+        if self.high < self.open:
+            return f"high({self.high}) < open({self.open})"
+        if self.high < self.close:
+            return f"high({self.high}) < close({self.close})"
+        if self.low > self.open:
+            return f"low({self.low}) > open({self.open})"
+        if self.low > self.close:
+            return f"low({self.low}) > close({self.close})"
+        if self.volume < 0:
+            return f"volume={self.volume}"
+        return None
+
     def isValid(self) -> bool:
-        """OHLC sanity check."""
-        return (
-            self.high >= self.low
-            and self.high >= self.open
-            and self.high >= self.close
-            and self.low <= self.open
-            and self.low <= self.close
-            and self.open > 0
-            and self.close > 0
-            and self.volume >= 0
-        )
+        return self.whyInvalid() is None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -189,12 +202,94 @@ def readCsvPrices(path: Path) -> tuple[list[PriceRow], list[tuple[int, str]]]:
         for i, raw in enumerate(reader, start=2):  # line 1 is header
             try:
                 pr = PriceRow.fromCsv(raw)
-            except (ValueError, KeyError) as e:
+            except (ValueError, InvalidOperation, KeyError) as e:
                 errors.append((i, f"parse error: {e}"))
                 continue
 
-            if not pr.isValid():
-                errors.append((i, f"OHLC sanity failed: {pr.symbol} {pr.trade_date}"))
+            reason = pr.whyInvalid()
+            if reason:
+                errors.append((i, f"OHLC sanity failed: {pr.symbol} {pr.trade_date} ({reason})"))
+                continue
+
+            rows.append(pr)
+
+    return rows, errors
+
+
+def _detectMsFormat(path: Path) -> None:
+    """Abort early if the file does not look like MetaStock daily format.
+
+    MetaStock daily: 8 columns, date field is YYYYMMDD (8 digits).
+    EC format uses 7 columns and YYMMDD (6-digit) dates with prices in cents —
+    ingesting it as MetaStock would produce dates from 1926 and prices 100× too high.
+    """
+    with open(path, newline="") as f:
+        first = next(csv.reader(f), None)
+
+    if first is None:
+        print("File is empty.", file=sys.stderr)
+        sys.exit(1)
+
+    ncols = len(first)
+    ds    = first[1].strip() if ncols > 1 else ""
+
+    if ncols == 7 and len(ds) == 6:
+        print(
+            f"ERROR: '{path.name}' looks like EC format "
+            f"(7 columns, 6-digit date '{ds}').\n"
+            "MetaStock format requires 8 columns and YYYYMMDD dates.\n"
+            "Prices in EC files are in cents — ingesting them as MetaStock\n"
+            "would produce values 100× too high with wrong dates.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if ncols != 8:
+        print(
+            f"ERROR: expected 8 columns (MetaStock daily), got {ncols} in '{path.name}'.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if len(ds) != 8 or not ds.isdigit():
+        print(
+            f"ERROR: expected 8-digit YYYYMMDD date in column 2, got '{ds}' in '{path.name}'.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def readMsPrices(path: Path) -> tuple[list[PriceRow], list[tuple[int, str]]]:
+    """Read MetaStock daily format (no header): SYMBOL,YYYYMMDD,O,H,L,C,VOL,OI"""
+    _detectMsFormat(path)
+
+    rows: list[PriceRow] = []
+    errors: list[tuple[int, str]] = []
+
+    with open(path, newline="") as f:
+        for i, cols in enumerate(csv.reader(f), start=1):
+            if len(cols) != 8:
+                errors.append((i, f"expected 8 fields, got {len(cols)}"))
+                continue
+            try:
+                ds = cols[1].strip()
+                trade_date = date(int(ds[:4]), int(ds[4:6]), int(ds[6:8]))
+                pr = PriceRow(
+                    symbol=cols[0].strip().upper(),
+                    trade_date=trade_date,
+                    open=Decimal(cols[2].strip()),
+                    high=Decimal(cols[3].strip()),
+                    low=Decimal(cols[4].strip()),
+                    close=Decimal(cols[5].strip()),
+                    volume=int(Decimal(cols[6].strip())),
+                )
+            except (ValueError, InvalidOperation, IndexError) as e:
+                errors.append((i, f"parse error: {e}"))
+                continue
+
+            reason = pr.whyInvalid()
+            if reason:
+                errors.append((i, f"OHLC sanity failed: {pr.symbol} {pr.trade_date} ({reason})"))
                 continue
 
             rows.append(pr)
@@ -249,6 +344,62 @@ def cmdPrices(args):
         # connection context will commit on normal exit and roll back on errors,
         # so we deliberately avoid intermediate commits before the final upsert
         # has succeeded.
+        if args.auto_add:
+            sym_map = autoAddInstruments(conn, all_symbols, args.exchange, args.currency)
+        else:
+            sym_map = loadSymbolMap(conn)
+            unknown = all_symbols - set(sym_map)
+            if unknown:
+                print(f"⚠  Unknown symbols (skipped): {sorted(unknown)}", file=sys.stderr)
+                rows = [r for r in rows if r.symbol in sym_map]
+
+        if not rows:
+            print("Nothing to ingest.", file=sys.stderr)
+            sys.exit(1)
+
+        params = [
+            {
+                "trade_date": r.trade_date,
+                "instrument_id": sym_map[r.symbol],
+                "open": r.open,
+                "high": r.high,
+                "low": r.low,
+                "close": r.close,
+                "volume": r.volume,
+            }
+            for r in rows
+        ]
+
+        with conn.cursor() as cur:
+            cur.executemany(UPSERT_SQL, params)
+        conn.commit()
+
+        dates = {r.trade_date for r in rows}
+        print(f"✓ Upserted {len(rows)} rows across {len(dates)} date(s)")
+
+
+def cmdImportEod(args):
+    path = Path(args.file)
+    if not path.exists():
+        print(f"File not found: {path}", file=sys.stderr)
+        sys.exit(1)
+
+    rows, errors = readMsPrices(path)
+
+    if errors:
+        print(f"⚠  {len(errors)} rows skipped:", file=sys.stderr)
+        for line_num, msg in errors[:10]:
+            print(f"   line {line_num}: {msg}", file=sys.stderr)
+        if len(errors) > 10:
+            print(f"   ... and {len(errors) - 10} more", file=sys.stderr)
+
+    if not rows:
+        print("No valid rows to ingest.", file=sys.stderr)
+        sys.exit(1)
+
+    all_symbols = {r.symbol for r in rows}
+
+    with psycopg.connect(args.dsn) as conn:
         if args.auto_add:
             sym_map = autoAddInstruments(conn, all_symbols, args.exchange, args.currency)
         else:
@@ -523,6 +674,7 @@ def main():
 workflow:
   1. Ingest prices (instruments auto-created as stubs):
        python src/loadEodData.py prices data/2026-04-09.csv
+       python src/loadEodData.py import-eod data/20260417_MS-Format.txt
 
   2. Backfill metadata from Yahoo Finance:
        python src/loadEodData.py enrich
@@ -586,10 +738,21 @@ examples:
     p_la = sub.add_parser("list-actions", help="List corporate actions for a symbol")
     p_la.add_argument("symbol")
 
+    # import-eod
+    p_ms = sub.add_parser("import-eod", help="Upsert EOD prices from MetaStock format file")
+    p_ms.add_argument("file", help="Path to MetaStock daily file (SYMBOL,YYYYMMDD,O,H,L,C,VOL,OI)")
+    p_ms.add_argument(
+        "--no-auto-add", dest="auto_add", action="store_false", default=True,
+        help="Skip unknown symbols instead of auto-creating them",
+    )
+    p_ms.add_argument("--exchange", default="ASX", help="Default exchange (default: ASX)")
+    p_ms.add_argument("--currency", default="AUD", help="Default currency (default: AUD)")
+
     args = parser.parse_args()
 
     dispatch = {
         "prices": cmdPrices,
+        "import-eod": cmdImportEod,
         "enrich": cmdEnrich,
         "add-instrument": cmdAddInstrument,
         "list-instruments": cmdListInstruments,
